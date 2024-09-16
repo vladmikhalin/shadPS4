@@ -13,52 +13,467 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
+#include "core/libraries/kernel/thread_management.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/net.h"
+#include "error_codes.h"
 
 namespace Libraries::Net {
 
-int PS4_SYSV_ABI in6addr_any() {
+#define orbis_net_errno (*sceNetErrnoLoc())
+
+struct OrbisNetSync {
+    int Init(s32 init, const char* name) {
+        mutex = nullptr;
+        auto res = Kernel::scePthreadMutexInit(&mutex, nullptr, name);
+        if (res < 0) {
+            return res;
+        }
+        cond = nullptr;
+        res = Kernel::scePthreadCondInit(&cond, nullptr, name);
+        if (res < 0) {
+            Kernel::scePthreadMutexDestroy(&mutex);
+            return res;
+        }
+        this->init = init;
+        return 0;
+    }
+
+    Kernel::ScePthreadMutex mutex = nullptr;
+    Kernel::ScePthreadCond cond = nullptr;
+    s32 init = 0;
+};
+
+struct OrbisNetGlobalState {
+    int Init() {
+        if (is_initialized) {
+            return 0;
+        }
+        auto res = dhcp_sync.Init(1, "LibnetSync");
+        if (res < 0) {
+            return res;
+        }
+        res = dhcp_sync.Init(1, "DhcpSync");
+        if (res < 0) {
+            return res;
+        }
+        res = dhcpd_sync.Init(1, "DhcpdSync");
+        if (res < 0) {
+            return res;
+        }
+        res = dup_ip_det_sync.Init(1, "DupIpDetSync");
+        if (res < 0) {
+            return res;
+        }
+        res = net_addrconfig6_sync.Init(1, "Addrconfig6Sync");
+        if (res < 0) {
+            return res;
+        }
+        res = info_sync.Init(1, "InfoSync");
+        if (res < 0) {
+            return res;
+        }
+        // FUN_01009640((GlobalState *)&DAT_0104c1e8,(unk1 *)&DAT_0103c108,0x10000,0);
+        is_initialized = true;
+        return 0;
+    }
+
+    bool is_initialized = false;
+
+    OrbisNetSync libnet_sync;
+    OrbisNetSync dhcp_sync;
+    OrbisNetSync dhcpd_sync;
+    OrbisNetSync dup_ip_det_sync;
+    OrbisNetSync net_addrconfig6_sync;
+    OrbisNetSync info_sync;
+
+    OrbisNetSync mem_sync;
+};
+
+#ifdef WIN32
+WSADATA Init() {
+    WSADATA data{};
+    WSAStartup(MAKEWORD(2, 2), &data);
+    return data;
+}
+
+static WSADATA wsaData = Init();
+#else
+#define INVALID_SOCKET -1
+#endif
+
+#ifndef WIN32
+#define POSIX_ERRNO_CASES                                                                          \
+    CASE(EPERM)                                                                                    \
+    CASE(ENOENT)                                                                                   \
+    CASE(ESRCH)                                                                                    \
+    CASE(EIO)                                                                                      \
+    CASE(ENXIO)                                                                                    \
+    CASE(E2BIG)                                                                                    \
+    CASE(ENOEXEC)                                                                                  \
+    CASE(EDEADLK)                                                                                  \
+    CASE(ENOMEM)                                                                                   \
+    CASE(ECHILD)                                                                                   \
+    CASE(EBUSY)                                                                                    \
+    CASE(EEXIST)                                                                                   \
+    CASE(EXDEV)                                                                                    \
+    CASE(ENODEV)                                                                                   \
+    CASE(ENOTDIR)                                                                                  \
+    CASE(EISDIR)                                                                                   \
+    CASE(ENFILE)                                                                                   \
+    CASE(ENOTTY)                                                                                   \
+    CASE(ETXTBSY)                                                                                  \
+    CASE(EFBIG)                                                                                    \
+    CASE(ENOSPC)                                                                                   \
+    CASE(ESPIPE)                                                                                   \
+    CASE(EROFS)                                                                                    \
+    CASE(EMLINK)                                                                                   \
+    CASE(EPIPE)                                                                                    \
+    CASE(EDOM)                                                                                     \
+    CASE(ERANGE)                                                                                   \
+    CASE(ENOLCK)                                                                                   \
+    CASE(ENOSYS)                                                                                   \
+    CASE(EIDRM)                                                                                    \
+    CASE(EOVERFLOW)                                                                                \
+    CASE(EILSEQ)                                                                                   \
+    CASE(ENOTSUP)                                                                                  \
+    CASE(ECANCELED)                                                                                \
+    CASE(EBADMSG)                                                                                  \
+    CASE(ENODATA)                                                                                  \
+    CASE(ENOSR)                                                                                    \
+    CASE(ENOSTR)                                                                                   \
+    CASE(ETIME)
+#else
+#define POSIX_ERRNO_CASES
+#endif
+
+#if defined(__APPLE__) || defined(WIN32)
+#define APPLE_WIN32_ERRNO_CASES CASE(EOPNOTSUPP)
+#else
+#define APPLE_WIN32_ERRNO_CASES
+#endif
+
+#define ERRNO_CASES                                                                                \
+    POSIX_ERRNO_CASES                                                                              \
+    APPLE_WIN32_ERRNO_CASES                                                                        \
+    CASE(EINTR)                                                                                    \
+    CASE(EBADF)                                                                                    \
+    CASE(EACCES)                                                                                   \
+    CASE(EFAULT)                                                                                   \
+    CASE(EINVAL)                                                                                   \
+    CASE(EMFILE)                                                                                   \
+    CASE(EWOULDBLOCK)                                                                              \
+    CASE(EINPROGRESS)                                                                              \
+    CASE(EALREADY)                                                                                 \
+    CASE(ENOTSOCK)                                                                                 \
+    CASE(EDESTADDRREQ)                                                                             \
+    CASE(EMSGSIZE)                                                                                 \
+    CASE(EPROTOTYPE)                                                                               \
+    CASE(ENOPROTOOPT)                                                                              \
+    CASE(EPROTONOSUPPORT)                                                                          \
+    CASE(EAFNOSUPPORT)                                                                             \
+    CASE(EADDRINUSE)                                                                               \
+    CASE(EADDRNOTAVAIL)                                                                            \
+    CASE(ENETDOWN)                                                                                 \
+    CASE(ENETUNREACH)                                                                              \
+    CASE(ENETRESET)                                                                                \
+    CASE(ECONNABORTED)                                                                             \
+    CASE(ECONNRESET)                                                                               \
+    CASE(ENOBUFS)                                                                                  \
+    CASE(EISCONN)                                                                                  \
+    CASE(ENOTCONN)                                                                                 \
+    CASE(ETIMEDOUT)                                                                                \
+    CASE(ECONNREFUSED)                                                                             \
+    CASE(ELOOP)                                                                                    \
+    CASE(ENAMETOOLONG)                                                                             \
+    CASE(EHOSTUNREACH)                                                                             \
+    CASE(ENOTEMPTY)
+
+#ifdef WIN32
+#define net_errno (WSAGetLastError())
+#else
+#define net_errno errno
+#endif
+
+static int ToOrbisNetError(int err) {
+    switch (err) {
+#ifdef WIN32
+#define CASE(err)                                                                                  \
+    case WSA##err:                                                                                 \
+        return ORBIS_NET_ERROR_##err;
+#else
+#define CASE(err)                                                                                  \
+    case (err):                                                                                    \
+        return ORBIS_NET_ERROR_##err;
+#endif
+        ERRNO_CASES
+#undef CASE
+    default:
+        return ORBIS_NET_ERROR_EINTERNAL;
+    }
+}
+
+static int ToOrbisNetErrno(int err) {
+    switch (err) {
+#ifdef WIN32
+#define CASE(err)                                                                                  \
+    case WSA##err:                                                                                 \
+        return ORBIS_NET_##err;
+#else
+#define CASE(err)                                                                                  \
+    case (err):                                                                                    \
+        return ORBIS_NET_##err;
+#endif
+        ERRNO_CASES
+#undef CASE
+    default:
+        return ORBIS_NET_EINTERNAL;
+    }
+}
+
+static void ToOrbisSockaddr(const sockaddr& src, OrbisNetSockaddr& dst) {
+    dst = OrbisNetSockaddr{};
+    const auto& src_sin = reinterpret_cast<const sockaddr_in&>(src);
+    auto& dst_sin = reinterpret_cast<OrbisNetSockaddrIn&>(dst);
+    dst_sin.sin_len = sizeof(OrbisNetSockaddrIn);
+    dst_sin.sin_family = src_sin.sin_family;
+    dst_sin.sin_port = src_sin.sin_port;
+    std::memcpy(&dst_sin.sin_addr, &src_sin.sin_addr, 4);
+}
+
+static void FromOrbisSockaddr(const OrbisNetSockaddr& src, sockaddr& dst) {
+    auto& dst_sin = reinterpret_cast<sockaddr_in&>(dst);
+    const auto& src_sin = reinterpret_cast<const OrbisNetSockaddrIn&>(src);
+    dst_sin.sin_family = src_sin.sin_family;
+    dst_sin.sin_port = src_sin.sin_port;
+    memcpy(&dst_sin.sin_addr, &src_sin.sin_addr, 4);
+}
+
+static int NetError(int err) {
+    orbis_net_errno = ToOrbisNetErrno(err);
+    return ToOrbisNetError(err);
+}
+
+OrbisNetId PS4_SYSV_ABI sceNetAccept(OrbisNetId s, OrbisNetSockaddr* paddr, u32* paddrlen) {
+    LOG_TRACE(Lib_Net, "called, s = {}", s);
+    if (paddr == nullptr) {
+        return NetError(EINVAL);
+    }
+    sockaddr addr{};
+    int addrlen = sizeof(sockaddr_in);
+    auto sock = accept(s, &addr, &addrlen);
+    if (sock == INVALID_SOCKET) {
+        return NetError(net_errno);
+    }
+    ToOrbisSockaddr(addr, *paddr);
+    *paddrlen = sizeof(OrbisNetSockaddrIn);
+    return sock;
+}
+
+int PS4_SYSV_ABI sceNetBind(OrbisNetId s, const OrbisNetSockaddr* paddr, u32 addrlen) {
+    LOG_TRACE(Lib_Net, "called, s = {}", s);
+    if (paddr == nullptr) {
+        return NetError(EINVAL);
+    }
+    sockaddr addr{};
+    FromOrbisSockaddr(*paddr, addr);
+    const auto res = bind(s, &addr, sizeof(sockaddr_in));
+    if (res < 0) {
+        return NetError(net_errno);
+    }
+    return ORBIS_OK;
+}
+
+int PS4_SYSV_ABI sceNetConnect(OrbisNetId s, const OrbisNetSockaddr* paddr, u32 addrlen) {
+    LOG_TRACE(Lib_Net, "called, s = {}", s);
+    if (paddr == nullptr) {
+        return NetError(EINVAL);
+    }
+    sockaddr addr{};
+    FromOrbisSockaddr(*paddr, addr);
+    const auto res = connect(s, &addr, sizeof(sockaddr_in));
+    if (res < 0) {
+        return NetError(net_errno);
+    }
+    return ORBIS_OK;
+}
+
+int PS4_SYSV_ABI sceNetGetpeername(OrbisNetId s, OrbisNetSockaddr* paddr, u32* paddrlen) {
+    LOG_TRACE(Lib_Net, "called, s = {}", s);
+    if (paddr == nullptr || paddrlen == nullptr) {
+        return NetError(EINVAL);
+    }
+    sockaddr addr{};
+    int addrlen = sizeof(sockaddr_in);
+    const auto res = getpeername(s, &addr, &addrlen);
+    if (res < 0) {
+        return NetError(net_errno);
+    }
+    ToOrbisSockaddr(addr, *paddr);
+    *paddrlen = sizeof(OrbisNetSockaddrIn);
+    return ORBIS_OK;
+}
+
+int PS4_SYSV_ABI sceNetGetsockname(OrbisNetId s, OrbisNetSockaddr* paddr, u32* paddrlen) {
+    LOG_TRACE(Lib_Net, "called, s = {}", s);
+    if (paddr == nullptr || paddrlen == nullptr) {
+        return NetError(EINVAL);
+    }
+    sockaddr addr{};
+    int addrlen = sizeof(sockaddr_in);
+    const auto res = getsockname(s, &addr, &addrlen);
+    if (res < 0) {
+        return NetError(net_errno);
+    }
+    ToOrbisSockaddr(addr, *paddr);
+    *paddrlen = sizeof(OrbisNetSockaddrIn);
+    return ORBIS_OK;
+}
+
+#ifdef WIN32
+#ifndef SO_REUSEPORT
+#define SO_REUSEPORT SO_REUSEADDR
+#endif
+#endif
+
+static int FromOrbisOptlevel(int level) {
+    switch (level) {
+#define CASE(level)                                                                                \
+    case ORBIS_NET_##level:                                                                        \
+        return level
+        CASE(IPPROTO_IP);
+        CASE(IPPROTO_ICMP);
+        CASE(IPPROTO_IGMP);
+        CASE(IPPROTO_TCP);
+        CASE(IPPROTO_UDP);
+        CASE(SOL_SOCKET);
+    default:
+        UNREACHABLE_MSG("Unexpected optlevel");
+    }
+}
+
+int FromOrbisSocketOptname(int optname) {
+    switch (optname) {
+#define CASE(name)                                                                                 \
+    case ORBIS_NET_##name:                                                                         \
+        return name
+        CASE(SO_REUSEADDR);
+        CASE(SO_KEEPALIVE);
+        CASE(SO_BROADCAST);
+        CASE(SO_LINGER);
+        CASE(SO_REUSEPORT);
+        CASE(SO_SNDBUF);
+        CASE(SO_RCVBUF);
+        CASE(SO_ERROR);
+        CASE(SO_TYPE);
+        CASE(SO_SNDTIMEO);
+        CASE(SO_RCVTIMEO);
+#undef CASE
+        // CASE(SO_ONESBCAST);
+        // CASE(SO_USECRYPTO);
+        // CASE(SO_USESIGNATURE);
+        // CASE(SO_ERROR_EX);
+        // CASE(SO_ACCEPTTIMEO);
+        // CASE(SO_CONNECTTIMEO);
+        // CASE(SO_NBIO);
+        // CASE(SO_POLICY);
+        // CASE(SO_NAME);
+        // CASE(SO_PRIORITY);
+    default:
+        LOG_ERROR(Lib_Net, "Unsupported socket optname 0x%08X", optname);
+        return -1;
+    }
+}
+
+int PS4_SYSV_ABI sceNetGetsockopt(OrbisNetId s, int level, int optname, void* optval, u32* optlen) {
+    LOG_ERROR(Lib_Net, "(STUBBED) called");
+    switch (level) {
+    case ORBIS_NET_IPPROTO_IP:
+    case ORBIS_NET_IPPROTO_ICMP:
+    case ORBIS_NET_IPPROTO_IGMP:
+    case ORBIS_NET_IPPROTO_TCP:
+    case ORBIS_NET_IPPROTO_UDP:
+    case ORBIS_NET_SOL_SOCKET: {
+        switch (optname) {
+        case ORBIS_NET_SO_NBIO: {
+            DWORD ret;
+            WSAIoctl(s, FIONBIO, nullptr, 0, optval, *optlen, &ret, nullptr, nullptr);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    }
+
+    optname = FromOrbisSocketOptname(optname);
+    if (optname < 0) {
+        return NetError(EINVAL);
+    }
+    level = FromOrbisOptlevel(level);
+    getsockopt(s, level, optname, reinterpret_cast<char*>(optval), reinterpret_cast<int*>(optlen));
+    return ORBIS_OK;
+}
+
+int PS4_SYSV_ABI sceNetListen(OrbisNetId s, int backlog) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI in6addr_loopback() {
+int PS4_SYSV_ABI sceNetRecv(OrbisNetId s, void* buf, size_t len, int flags) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sce_net_dummy() {
+int PS4_SYSV_ABI sceNetRecvfrom(OrbisNetId s, void* buf, size_t len, int flags,
+                                OrbisNetSockaddr* addr, u32* paddrlen) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sce_net_in6addr_any() {
+int PS4_SYSV_ABI sceNetRecvmsg(OrbisNetId s, OrbisNetMsghdr* msg, int flags) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sce_net_in6addr_linklocal_allnodes() {
+int PS4_SYSV_ABI sceNetSend(OrbisNetId s, const void* buf, size_t len, int flags) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sce_net_in6addr_linklocal_allrouters() {
+int PS4_SYSV_ABI sceNetSendmsg(OrbisNetId s, const OrbisNetMsghdr* msg, int flags) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sce_net_in6addr_loopback() {
+int PS4_SYSV_ABI sceNetSendto(OrbisNetId s, const void* buf, size_t len, int flags,
+                              const OrbisNetSockaddr* addr, u32 addrlen) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sce_net_in6addr_nodelocal_allnodes() {
+int PS4_SYSV_ABI sceNetSetsockopt(OrbisNetId s, int level, int optname, const void* optval,
+                                  u32 optlen) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-OrbisNetId PS4_SYSV_ABI sceNetAccept(OrbisNetId s, OrbisNetSockaddr* addr, u32* paddrlen) {
+int PS4_SYSV_ABI sceNetShutdown(OrbisNetId s, int how) {
+    LOG_ERROR(Lib_Net, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+int PS4_SYSV_ABI sceNetSocket(const char* name, int family, int type, int protocol) {
+    LOG_ERROR(Lib_Net, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+int PS4_SYSV_ABI sceNetSocketAbort(OrbisNetId s, int flags) {
+    LOG_ERROR(Lib_Net, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+int PS4_SYSV_ABI sceNetSocketClose(OrbisNetId s) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
@@ -114,11 +529,6 @@ int PS4_SYSV_ABI sceNetBandwidthControlSetIfParam() {
 }
 
 int PS4_SYSV_ABI sceNetBandwidthControlSetPolicy() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetBind(OrbisNetId s, const OrbisNetSockaddr* addr, u32 addrlen) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
@@ -463,11 +873,6 @@ int PS4_SYSV_ABI sceNetConfigWlanSetDeviceConfig() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetConnect() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
 int PS4_SYSV_ABI sceNetControl() {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
@@ -563,9 +968,10 @@ int PS4_SYSV_ABI sceNetEpollWait() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetErrnoLoc() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
+static thread_local int g_sce_net_errno;
+int* PS4_SYSV_ABI sceNetErrnoLoc() {
+    LOG_TRACE(Lib_Net, "called");
+    return &g_sce_net_errno;
 }
 
 int PS4_SYSV_ABI sceNetEtherNtostr() {
@@ -653,11 +1059,6 @@ int PS4_SYSV_ABI sceNetGetNameToIndex() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetGetpeername() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
 int PS4_SYSV_ABI sceNetGetRandom() {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
@@ -674,16 +1075,6 @@ int PS4_SYSV_ABI sceNetGetSockInfo() {
 }
 
 int PS4_SYSV_ABI sceNetGetSockInfo6() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetGetsockname(OrbisNetId s, OrbisNetSockaddr* addr, u32* paddrlen) {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetGetsockopt(OrbisNetId s, int level, int optname, void* optval, u32* optlen) {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
@@ -772,11 +1163,6 @@ int PS4_SYSV_ABI sceNetIoctl() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetListen() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
 int PS4_SYSV_ABI sceNetMemoryAllocate() {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
@@ -816,22 +1202,6 @@ int PS4_SYSV_ABI sceNetPppoeStart() {
 }
 
 int PS4_SYSV_ABI sceNetPppoeStop() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetRecv() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetRecvfrom(OrbisNetId s, void* buf, size_t len, int flags,
-                                OrbisNetSockaddr* addr, u32* paddrlen) {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetRecvmsg() {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
@@ -906,21 +1276,6 @@ int PS4_SYSV_ABI sceNetResolverStartNtoaMultipleRecordsEx() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetSend() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetSendmsg() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetSendto() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
 int PS4_SYSV_ABI sceNetSetDns6Info() {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
@@ -937,11 +1292,6 @@ int PS4_SYSV_ABI sceNetSetDnsInfo() {
 }
 
 int PS4_SYSV_ABI sceNetSetDnsInfoToKernel() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetSetsockopt() {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
 }
@@ -1026,26 +1376,6 @@ int PS4_SYSV_ABI sceNetShowRouteWithMemory() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetShutdown() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetSocket(const char* name, int family, int type, int protocol) {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetSocketAbort() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNetSocketClose() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
 int PS4_SYSV_ABI sceNetSyncCreate() {
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     return ORBIS_OK;
@@ -1116,19 +1446,51 @@ int PS4_SYSV_ABI sceNetEmulationSet() {
     return ORBIS_OK;
 }
 
+OrbisNetIn6Addr g_in6addr_any{.sin_addr = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
+OrbisNetIn6Addr g_in6addr_loopback{.sin_addr = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
+OrbisNetIn6Addr g_in6addr_dummy{.sin_addr = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
+OrbisNetIn6Addr g_sce_net_in6addr_linklocal_allnodes{
+    .sin_addr = {255, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
+OrbisNetIn6Addr g_sce_net_in6addr_linklocal_allrouters{
+    .sin_addr = {255, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}};
+OrbisNetIn6Addr g_sce_net_in6addr_any{.sin_addr = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
+OrbisNetIn6Addr g_sce_net_in6addr_loopback{
+    .sin_addr = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
+OrbisNetIn6Addr g_sce_net_in6addr_nodelocal_allnodes{
+    .sin_addr = {255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
+
 void RegisterlibSceNet(Core::Loader::SymbolsResolver* sym) {
-    LIB_FUNCTION("ZRAJo-A-ukc", "libSceNet", 1, "libSceNet", 1, 1, in6addr_any);
-    LIB_FUNCTION("XCuA-GqjA-k", "libSceNet", 1, "libSceNet", 1, 1, in6addr_loopback);
-    LIB_FUNCTION("VZgoeBxPXUQ", "libSceNet", 1, "libSceNet", 1, 1, sce_net_dummy);
-    LIB_FUNCTION("GAtITrgxKDE", "libSceNet", 1, "libSceNet", 1, 1, sce_net_in6addr_any);
-    LIB_FUNCTION("84MgU4MMTLQ", "libSceNet", 1, "libSceNet", 1, 1,
-                 sce_net_in6addr_linklocal_allnodes);
-    LIB_FUNCTION("2uSWyOKYc1M", "libSceNet", 1, "libSceNet", 1, 1,
-                 sce_net_in6addr_linklocal_allrouters);
-    LIB_FUNCTION("P3AeWBvPrkg", "libSceNet", 1, "libSceNet", 1, 1, sce_net_in6addr_loopback);
-    LIB_FUNCTION("PgNI+j4zxzM", "libSceNet", 1, "libSceNet", 1, 1,
-                 sce_net_in6addr_nodelocal_allnodes);
+    LIB_OBJ("ZRAJo-A-ukc", "libSceNet", 1, "libSceNet", 1, 1, &g_in6addr_any);
+    LIB_OBJ("XCuA-GqjA-k", "libSceNet", 1, "libSceNet", 1, 1, &g_in6addr_loopback);
+    LIB_OBJ("VZgoeBxPXUQ", "libSceNet", 1, "libSceNet", 1, 1, &g_in6addr_dummy);
+    LIB_OBJ("GAtITrgxKDE", "libSceNet", 1, "libSceNet", 1, 1, &g_sce_net_in6addr_any);
+    LIB_OBJ("84MgU4MMTLQ", "libSceNet", 1, "libSceNet", 1, 1,
+            &g_sce_net_in6addr_linklocal_allnodes);
+    LIB_OBJ("2uSWyOKYc1M", "libSceNet", 1, "libSceNet", 1, 1,
+            &g_sce_net_in6addr_linklocal_allrouters);
+    LIB_OBJ("P3AeWBvPrkg", "libSceNet", 1, "libSceNet", 1, 1, &g_sce_net_in6addr_loopback);
+    LIB_OBJ("PgNI+j4zxzM", "libSceNet", 1, "libSceNet", 1, 1,
+            &g_sce_net_in6addr_nodelocal_allnodes);
+
     LIB_FUNCTION("PIWqhn9oSxc", "libSceNet", 1, "libSceNet", 1, 1, sceNetAccept);
+    LIB_FUNCTION("bErx49PgxyY", "libSceNet", 1, "libSceNet", 1, 1, sceNetBind);
+    LIB_FUNCTION("OXXX4mUk3uk", "libSceNet", 1, "libSceNet", 1, 1, sceNetConnect);
+    LIB_FUNCTION("TCkRD0DWNLg", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetpeername);
+    LIB_FUNCTION("hoOAofhhRvE", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetsockname);
+    LIB_FUNCTION("xphrZusl78E", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetsockopt);
+    LIB_FUNCTION("kOj1HiAGE54", "libSceNet", 1, "libSceNet", 1, 1, sceNetListen);
+    LIB_FUNCTION("9wO9XrMsNhc", "libSceNet", 1, "libSceNet", 1, 1, sceNetRecv);
+    LIB_FUNCTION("304ooNZxWDY", "libSceNet", 1, "libSceNet", 1, 1, sceNetRecvfrom);
+    LIB_FUNCTION("wvuUDv0jrMI", "libSceNet", 1, "libSceNet", 1, 1, sceNetRecvmsg);
+    LIB_FUNCTION("beRjXBn-z+o", "libSceNet", 1, "libSceNet", 1, 1, sceNetSend);
+    LIB_FUNCTION("2eKbgcboJso", "libSceNet", 1, "libSceNet", 1, 1, sceNetSendmsg);
+    LIB_FUNCTION("gvD1greCu0A", "libSceNet", 1, "libSceNet", 1, 1, sceNetSendto);
+    LIB_FUNCTION("2mKX2Spso7I", "libSceNet", 1, "libSceNet", 1, 1, sceNetSetsockopt);
+    LIB_FUNCTION("TSM6whtekok", "libSceNet", 1, "libSceNet", 1, 1, sceNetShutdown);
+    LIB_FUNCTION("Q4qBuN-c0ZM", "libSceNet", 1, "libSceNet", 1, 1, sceNetSocket);
+    LIB_FUNCTION("zJGf8xjFnQE", "libSceNet", 1, "libSceNet", 1, 1, sceNetSocketAbort);
+    LIB_FUNCTION("45ggEzakPJQ", "libSceNet", 1, "libSceNet", 1, 1, sceNetSocketClose);
+
     LIB_FUNCTION("BTUvkWzrP68", "libSceNet", 1, "libSceNet", 1, 1, sceNetAddrConfig6GetInfo);
     LIB_FUNCTION("3qG7UJy2Fq8", "libSceNet", 1, "libSceNet", 1, 1, sceNetAddrConfig6Start);
     LIB_FUNCTION("P+0ePpDfUAQ", "libSceNet", 1, "libSceNet", 1, 1, sceNetAddrConfig6Stop);
@@ -1145,7 +1507,6 @@ void RegisterlibSceNet(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("g4DKkzV2qC4", "libSceNet", 1, "libSceNet", 1, 1,
                  sceNetBandwidthControlSetIfParam);
     LIB_FUNCTION("7Z1hhsEmkQU", "libSceNet", 1, "libSceNet", 1, 1, sceNetBandwidthControlSetPolicy);
-    LIB_FUNCTION("bErx49PgxyY", "libSceNet", 1, "libSceNet", 1, 1, sceNetBind);
     LIB_FUNCTION("eyLyLJrdEOU", "libSceNet", 1, "libSceNet", 1, 1, sceNetClearDnsCache);
     LIB_FUNCTION("Ea2NaVMQNO8", "libSceNet", 1, "libSceNet", 1, 1, sceNetConfigAddArp);
     LIB_FUNCTION("0g0qIuPN3ZQ", "libSceNet", 1, "libSceNet", 1, 1, sceNetConfigAddArpWithInterface);
@@ -1232,7 +1593,6 @@ void RegisterlibSceNet(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("273-I-zD8+8", "libSceNet", 1, "libSceNet", 1, 1, sceNetConfigWlanInfraScanJoin);
     LIB_FUNCTION("-Mi5hNiWC4c", "libSceNet", 1, "libSceNet", 1, 1, sceNetConfigWlanScan);
     LIB_FUNCTION("U1q6DrPbY6k", "libSceNet", 1, "libSceNet", 1, 1, sceNetConfigWlanSetDeviceConfig);
-    LIB_FUNCTION("OXXX4mUk3uk", "libSceNet", 1, "libSceNet", 1, 1, sceNetConnect);
     LIB_FUNCTION("lDTIbqNs0ps", "libSceNet", 1, "libSceNet", 1, 1, sceNetControl);
     LIB_FUNCTION("Q6T-zIblNqk", "libSceNet", 1, "libSceNet", 1, 1, sceNetDhcpdStart);
     LIB_FUNCTION("xwWm8jzrpeM", "libSceNet", 1, "libSceNet", 1, 1, sceNetDhcpdStop);
@@ -1270,13 +1630,10 @@ void RegisterlibSceNet(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("6Oc0bLsIYe0", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetMacAddress);
     LIB_FUNCTION("rMyh97BU5pY", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetMemoryPoolStats);
     LIB_FUNCTION("+S-2-jlpaBo", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetNameToIndex);
-    LIB_FUNCTION("TCkRD0DWNLg", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetpeername);
     LIB_FUNCTION("G3O2j9f5z00", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetRandom);
     LIB_FUNCTION("6Nx1hIQL9h8", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetRouteInfo);
     LIB_FUNCTION("hLuXdjHnhiI", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetSockInfo);
     LIB_FUNCTION("Cidi9Y65mP8", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetSockInfo6);
-    LIB_FUNCTION("hoOAofhhRvE", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetsockname);
-    LIB_FUNCTION("xphrZusl78E", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetsockopt);
     LIB_FUNCTION("GA5ZDaLtUBE", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetStatisticsInfo);
     LIB_FUNCTION("9mIcUExH34w", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetStatisticsInfoInternal);
     LIB_FUNCTION("p2vxsE2U3RQ", "libSceNet", 1, "libSceNet", 1, 1, sceNetGetSystemTime);
@@ -1293,7 +1650,6 @@ void RegisterlibSceNet(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("Nlev7Lg8k3A", "libSceNet", 1, "libSceNet", 1, 1, sceNetInit);
     LIB_FUNCTION("6MojQ8uFHEI", "libSceNet", 1, "libSceNet", 1, 1, sceNetInitParam);
     LIB_FUNCTION("ghqRRVQxqKo", "libSceNet", 1, "libSceNet", 1, 1, sceNetIoctl);
-    LIB_FUNCTION("kOj1HiAGE54", "libSceNet", 1, "libSceNet", 1, 1, sceNetListen);
     LIB_FUNCTION("HKIa-WH0AZ4", "libSceNet", 1, "libSceNet", 1, 1, sceNetMemoryAllocate);
     LIB_FUNCTION("221fvqVs+sQ", "libSceNet", 1, "libSceNet", 1, 1, sceNetMemoryFree);
     LIB_FUNCTION("pQGpHYopAIY", "libSceNet", 1, "libSceNet", 1, 1, sceNetNtohl);
@@ -1303,9 +1659,6 @@ void RegisterlibSceNet(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("K7RlrTkI-mw", "libSceNet", 1, "libSceNet", 1, 1, sceNetPoolDestroy);
     LIB_FUNCTION("QGOqGPnk5a4", "libSceNet", 1, "libSceNet", 1, 1, sceNetPppoeStart);
     LIB_FUNCTION("FIV95WE1EuE", "libSceNet", 1, "libSceNet", 1, 1, sceNetPppoeStop);
-    LIB_FUNCTION("9wO9XrMsNhc", "libSceNet", 1, "libSceNet", 1, 1, sceNetRecv);
-    LIB_FUNCTION("304ooNZxWDY", "libSceNet", 1, "libSceNet", 1, 1, sceNetRecvfrom);
-    LIB_FUNCTION("wvuUDv0jrMI", "libSceNet", 1, "libSceNet", 1, 1, sceNetRecvmsg);
     LIB_FUNCTION("AzqoBha7js4", "libSceNet", 1, "libSceNet", 1, 1, sceNetResolverAbort);
     LIB_FUNCTION("JQk8ck8vnPY", "libSceNet", 1, "libSceNet", 1, 1, sceNetResolverConnect);
     LIB_FUNCTION("bonnMiDoOZg", "libSceNet", 1, "libSceNet", 1, 1, sceNetResolverConnectAbort);
@@ -1322,14 +1675,10 @@ void RegisterlibSceNet(Core::Loader::SymbolsResolver* sym) {
                  sceNetResolverStartNtoaMultipleRecords);
     LIB_FUNCTION("sT4nBQKUPqM", "libSceNet", 1, "libSceNet", 1, 1,
                  sceNetResolverStartNtoaMultipleRecordsEx);
-    LIB_FUNCTION("beRjXBn-z+o", "libSceNet", 1, "libSceNet", 1, 1, sceNetSend);
-    LIB_FUNCTION("2eKbgcboJso", "libSceNet", 1, "libSceNet", 1, 1, sceNetSendmsg);
-    LIB_FUNCTION("gvD1greCu0A", "libSceNet", 1, "libSceNet", 1, 1, sceNetSendto);
     LIB_FUNCTION("15Ywg-ZsSl0", "libSceNet", 1, "libSceNet", 1, 1, sceNetSetDns6Info);
     LIB_FUNCTION("E3oH1qsdqCA", "libSceNet", 1, "libSceNet", 1, 1, sceNetSetDns6InfoToKernel);
     LIB_FUNCTION("B-M6KjO8-+w", "libSceNet", 1, "libSceNet", 1, 1, sceNetSetDnsInfo);
     LIB_FUNCTION("8s+T0bJeyLQ", "libSceNet", 1, "libSceNet", 1, 1, sceNetSetDnsInfoToKernel);
-    LIB_FUNCTION("2mKX2Spso7I", "libSceNet", 1, "libSceNet", 1, 1, sceNetSetsockopt);
     LIB_FUNCTION("k1V1djYpk7k", "libSceNet", 1, "libSceNet", 1, 1, sceNetShowIfconfig);
     LIB_FUNCTION("j6pkkO2zJtg", "libSceNet", 1, "libSceNet", 1, 1, sceNetShowIfconfigForBuffer);
     LIB_FUNCTION("E8dTcvQw3hg", "libSceNet", 1, "libSceNet", 1, 1, sceNetShowIfconfigWithMemory);
@@ -1346,10 +1695,6 @@ void RegisterlibSceNet(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("TCZyE2YI1uM", "libSceNet", 1, "libSceNet", 1, 1, sceNetShowRoute6WithMemory);
     LIB_FUNCTION("n-IAZb7QB1Y", "libSceNet", 1, "libSceNet", 1, 1, sceNetShowRouteForBuffer);
     LIB_FUNCTION("0-XSSp1kEFM", "libSceNet", 1, "libSceNet", 1, 1, sceNetShowRouteWithMemory);
-    LIB_FUNCTION("TSM6whtekok", "libSceNet", 1, "libSceNet", 1, 1, sceNetShutdown);
-    LIB_FUNCTION("Q4qBuN-c0ZM", "libSceNet", 1, "libSceNet", 1, 1, sceNetSocket);
-    LIB_FUNCTION("zJGf8xjFnQE", "libSceNet", 1, "libSceNet", 1, 1, sceNetSocketAbort);
-    LIB_FUNCTION("45ggEzakPJQ", "libSceNet", 1, "libSceNet", 1, 1, sceNetSocketClose);
     LIB_FUNCTION("6AJE2jKg-c0", "libSceNet", 1, "libSceNet", 1, 1, sceNetSyncCreate);
     LIB_FUNCTION("atGfzCaXMak", "libSceNet", 1, "libSceNet", 1, 1, sceNetSyncDestroy);
     LIB_FUNCTION("sAleh-BoxLA", "libSceNet", 1, "libSceNet", 1, 1, sceNetSyncGet);
